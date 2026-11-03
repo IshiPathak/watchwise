@@ -34,11 +34,6 @@
       .trim() || "";
   }
 
-  function getChannel(row) {
-    return row.querySelector("#channel-name")?.textContent
-      ?.replace(/\s+/g, " ")
-      .trim() || "";
-  }
 
   function getWords(text) {
     return text
@@ -53,35 +48,10 @@
       );
   }
 
-  function getTopic(row) {
-    const title = getTitle(row);
-    const channel = getChannel(row);
-
-    // Titles carry more weight than channel names.
-    const words = getWords(title);
-    const counts = new Map();
-
-    for (const word of words) {
-      counts.set(word, (counts.get(word) || 0) + 2);
-    }
-
-    for (const word of getWords(channel)) {
-      counts.set(word, (counts.get(word) || 0) + 1);
-    }
-
-    // A title with no useful words can remain uncategorized.
-    if (counts.size === 0) return "Uncategorized";
-
-    // Choose the strongest locally detected keyword.
-    const ranked = [...counts.entries()].sort(
-      (a, b) => b[1] - a[1] ||
-        words.indexOf(a[0]) - words.indexOf(b[0]) ||
-        a[0].localeCompare(b[0])
-    );
-
-    const keyword = ranked[0][0];
-    return keyword.charAt(0).toUpperCase() + keyword.slice(1);
-  }
+  
+function getTopicWords(row) {
+  return [...new Set(getWords(getTitle(row)))];
+}
 
   function createInterface() {
     let root = document.getElementById(ROOT_ID);
@@ -106,12 +76,18 @@
     `;
 
     const playlist = document.querySelector(
-      "ytd-playlist-video-list-renderer"
-    );
+  "ytd-playlist-video-list-renderer"
+);
 
-    if (playlist) {
-      playlist.parentElement.insertBefore(root, playlist);
-    }
+if (playlist) {
+  const contents = playlist.querySelector("#contents");
+
+  if (contents) {
+    playlist.insertBefore(root, contents);
+  } else {
+    playlist.prepend(root);
+  }
+}
 
     return root;
   }
@@ -136,14 +112,44 @@
     // Recheck in case YouTube has not rendered the playlist container yet.
     if (!root.isConnected) return;
 
-    const topicByRow = new Map();
-    const topicCounts = new Map();
+    
+const wordsByRow = new Map();
+const wordFrequency = new Map();
 
-    for (const row of rows) {
-      const topic = getTopic(row);
-      topicByRow.set(row, topic);
-      topicCounts.set(topic, (topicCounts.get(topic) || 0) + 1);
-    }
+// Count how often each keyword appears across video titles.
+for (const row of rows) {
+  const words = getTopicWords(row);
+  wordsByRow.set(row, words);
+
+  for (const word of words) {
+    wordFrequency.set(
+      word,
+      (wordFrequency.get(word) || 0) + 1
+    );
+  }
+}
+
+const topicByRow = new Map();
+const topicCounts = new Map();
+
+// Only recurring keywords become categories.
+for (const row of rows) {
+  const candidates = wordsByRow.get(row)
+    .filter(word => wordFrequency.get(word) >= 2)
+    .sort((a, b) =>
+      wordFrequency.get(b) - wordFrequency.get(a) ||
+      a.localeCompare(b)
+    );
+
+  const keyword = candidates[0];
+  const topic = keyword
+    ? keyword.charAt(0).toUpperCase() + keyword.slice(1)
+    : "Other";
+
+  topicByRow.set(row, topic);
+  topicCounts.set(topic, (topicCounts.get(topic) || 0) + 1);
+}
+
 
     const topics = [...topicCounts.keys()].sort((a, b) =>
       a.localeCompare(b)
