@@ -1,17 +1,21 @@
 
 (() => {
-  if (window.__watchwiseV2) return;
-  window.__watchwiseV2 = true;
+  if (window.__watchwiseV3) return;
+  window.__watchwiseV3 = true;
 
   const ROOT_ID = "watchwise-root";
   const ROW_SELECTOR = "ytd-playlist-video-renderer";
-  const collectedVideos = new Map();
+  const SAMPLE_SIZE = 200;
+  const MAX_ROUNDS = 1200;
+
+  const videos = new Map();
 
   let categories = [];
   let activeCategory = "all";
   let scanning = false;
+  let viewMode = "grid";
+  let playlistContents = null;
 
-  // Common words that do not help identify video topics.
   const STOP_WORDS = new Set(`
     the and for with from into about your this that what when
     where why how are was were you all can will just have has
@@ -22,12 +26,17 @@
     everything something really very more most only also
     my me i we he she it a an to of in on at by as is be
     do did does if or so up out over after before
+    please like subscribe channel music song songs
   `.split(/\s+/));
 
-  const wait = (ms) =>
+  const wait = ms =>
     new Promise(resolve => setTimeout(resolve, ms));
 
-  function getPlaylistContents() {
+  function isWatchLater() {
+    return new URLSearchParams(location.search).get("list") === "WL";
+  }
+
+  function getContents() {
     return document.querySelector(
       "ytd-playlist-video-list-renderer #contents"
     );
@@ -45,39 +54,47 @@
     }
   }
 
-  // Collect titles and thumbnails only.
+  function getDuration(row) {
+    const text = [
+      ...row.querySelectorAll(
+        "ytd-thumbnail-overlay-time-status-renderer, " +
+        "ytd-thumbnail-overlay-time-status-renderer span, " +
+        "ytd-thumbnail-overlay-time-status-renderer #text"
+      )
+    ]
+      .map(element => element.textContent || "")
+      .join(" ");
+
+    return text.match(/\b\d{1,2}:\d{2}(?::\d{2})?\b/)?.[0] || "";
+  }
+
   function collectVisibleVideos() {
-    const rows = document.querySelectorAll(ROW_SELECTOR);
     let added = 0;
 
-    rows.forEach(row => {
-      const link = row.querySelector("a#video-title");
+    document.querySelectorAll(ROW_SELECTOR).forEach(row => {
+      const link = row.querySelector(
+        "a#video-title, a#video-title-link"
+      );
+
       if (!link) return;
 
       const title = (
-        link.textContent ||
         link.getAttribute("title") ||
+        link.textContent ||
         ""
       ).replace(/\s+/g, " ").trim();
 
       const id = getVideoId(link.href);
 
-      if (!id || !title || collectedVideos.has(id)) return;
+      if (!id || !title || videos.has(id)) return;
 
-      const thumbnail = row.querySelector(
-        "ytd-thumbnail img"
-      )?.src || "";
-
-      const duration = row.querySelector(
-        "ytd-thumbnail-overlay-time-status-renderer"
-      )?.textContent?.trim() || "";
-
-      collectedVideos.set(id, {
+      videos.set(id, {
         id,
         title,
-        url: link.href,
-        thumbnail,
-        duration
+        url: `https://www.youtube.com/watch?v=${id}`,
+        thumbnail: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`,
+        duration: getDuration(row),
+        category: "Other"
       });
 
       added++;
@@ -86,9 +103,12 @@
     return added;
   }
 
-  // Convert a title into useful words.
+  // -------------------------------
+  // TITLE ANALYSIS
+  // -------------------------------
+
   function tokenize(title) {
-    return title
+    const words = title
       .toLowerCase()
       .replace(/https?:\/\/\S+/g, " ")
       .replace(/[^\p{L}\p{N}+# ]/gu, " ")
@@ -98,174 +118,195 @@
         !STOP_WORDS.has(word) &&
         !/^\d+$/.test(word)
       );
-  }
 
-  function cosine(a, b) {
-    let dot = 0;
-    let normA = 0;
-    let normB = 0;
+    const tokens = [...words];
 
-    for (const value of a.values()) {
-      normA += value * value;
+    // Include adjacent word pairs for more descriptive topics.
+    for (let i = 0; i < words.length - 1; i++) {
+      tokens.push(`${words[i]}_${words[i + 1]}`);
     }
 
-    for (const value of b.values()) {
-      normB += value * value;
-    }
-
-    for (const [word, value] of a) {
-      dot += value * (b.get(word) || 0);
-    }
-
-    if (!normA || !normB) return 0;
-
-    return dot / Math.sqrt(normA * normB);
+    return tokens;
   }
 
   function normalize(vector) {
-    let length = 0;
+    let magnitude = 0;
 
     for (const value of vector.values()) {
-      length += value * value;
+      magnitude += value * value;
     }
 
-    length = Math.sqrt(length);
+    magnitude = Math.sqrt(magnitude);
 
-    if (!length) return vector;
+    if (!magnitude) return vector;
 
     for (const [word, value] of vector) {
-      vector.set(word, value / length);
+      vector.set(word, value / magnitude);
     }
 
     return vector;
   }
 
-  function makeCentroid(documents, assignments, cluster) {
-    const centroid = new Map();
-    let count = 0;
+  function cosine(a, b) {
+    let dot = 0;
 
-    documents.forEach((doc, index) => {
-      if (assignments[index] !== cluster) return;
-
-      count++;
-
-      for (const [word, value] of doc.vector) {
-        centroid.set(
-          word,
-          (centroid.get(word) || 0) + value
-        );
-      }
-    });
-
-    if (!count) return centroid;
-
-    for (const [word, value] of centroid) {
-      centroid.set(word, value / count);
+    for (const [word, value] of a) {
+      dot += value * (b.get(word) || 0);
     }
 
-    return normalize(centroid);
+    return dot;
   }
 
-  // Discover broad groups from the actual playlist.
-  function discoverTopics(videos) {
-    const documents = videos.map(video => ({
+  function buildVectors(sample, allVideos) {
+    const docs = sample.map(video => ({
       video,
       tokens: tokenize(video.title),
       vector: new Map()
     }));
 
-    const documentFrequency = new Map();
+    const df = new Map();
 
-    documents.forEach(doc => {
-      for (const word of new Set(doc.tokens)) {
-        documentFrequency.set(
-          word,
-          (documentFrequency.get(word) || 0) + 1
-        );
+    docs.forEach(doc => {
+      for (const token of new Set(doc.tokens)) {
+        df.set(token, (df.get(token) || 0) + 1);
       }
     });
 
-    const minFrequency = Math.max(
+    const minimumFrequency = Math.max(
       2,
-      Math.ceil(documents.length * 0.01)
+      Math.ceil(sample.length * 0.01)
     );
 
     const vocabulary = new Set(
-      [...documentFrequency.entries()]
-        .filter(([, frequency]) => frequency >= minFrequency)
+      [...df.entries()]
+        .filter(([, count]) => count >= minimumFrequency)
         .map(([word]) => word)
     );
 
-    documents.forEach(doc => {
-      const frequencies = new Map();
+    function vectorize(title) {
+      const tokens = tokenize(title);
+      const counts = new Map();
 
-      for (const word of doc.tokens) {
-        if (vocabulary.has(word)) {
-          frequencies.set(
-            word,
-            (frequencies.get(word) || 0) + 1
-          );
+      tokens.forEach(token => {
+        if (vocabulary.has(token)) {
+          counts.set(token, (counts.get(token) || 0) + 1);
         }
-      }
+      });
 
-      for (const [word, count] of frequencies) {
-        const idf = Math.log(
-          1 + documents.length /
-          (1 + documentFrequency.get(word))
+      const vector = new Map();
+
+      counts.forEach((count, word) => {
+        const inverseFrequency = Math.log(
+          1 + sample.length / (1 + df.get(word))
         );
 
-        doc.vector.set(word, (1 + Math.log(count)) * idf);
-      }
+        vector.set(
+          word,
+          (1 + Math.log(count)) * inverseFrequency
+        );
+      });
 
-      normalize(doc.vector);
+      return normalize(vector);
+    }
+
+    docs.forEach(doc => {
+      doc.vector = vectorize(doc.video.title);
     });
 
-    // If there is too little useful text, avoid inventing topics.
-    const usefulDocs = documents.filter(
+    const allVectors = new Map();
+
+    allVideos.forEach(video => {
+      allVectors.set(video.id, vectorize(video.title));
+    });
+
+    return { docs, allVectors };
+  }
+
+  function centroidFor(docs, assignments, cluster) {
+    const centroid = new Map();
+    let count = 0;
+
+    docs.forEach((doc, index) => {
+      if (assignments[index] !== cluster) return;
+
+      count++;
+
+      doc.vector.forEach((value, word) => {
+        centroid.set(
+          word,
+          (centroid.get(word) || 0) + value
+        );
+      });
+    });
+
+    if (!count) return centroid;
+
+    centroid.forEach((value, word) => {
+      centroid.set(word, value / count);
+    });
+
+    return normalize(centroid);
+  }
+
+  // -------------------------------
+  // AUTOMATIC TOPIC DISCOVERY
+  // -------------------------------
+
+  function discoverTopics(sample, allVideos) {
+    const { docs, allVectors } = buildVectors(
+      sample,
+      allVideos
+    );
+
+    const usefulDocs = docs.filter(
       doc => doc.vector.size > 0
     );
 
-    if (usefulDocs.length < 8) {
-      return [{
-        name: "All videos",
-        videos
-      }];
+    if (usefulDocs.length < 15) {
+      return {
+        groups: [],
+        allVectors,
+        centroids: []
+      };
     }
 
     const k = Math.min(
-      8,
-      Math.max(5, Math.round(videos.length / 80) + 4),
-      Math.floor(usefulDocs.length / 3)
+      12,
+      Math.max(8, Math.round(usefulDocs.length / 20)),
+      Math.floor(usefulDocs.length / 5)
     );
 
     // Deterministic farthest-first initialization.
     const centroids = [usefulDocs[0].vector];
 
     while (centroids.length < k) {
-      let bestDoc = null;
+      let best = null;
       let bestDistance = -1;
 
-      for (const doc of usefulDocs) {
-        const nearest = Math.max(
-          ...centroids.map(center => cosine(doc.vector, center))
+      usefulDocs.forEach(doc => {
+        const closest = Math.max(
+          ...centroids.map(center =>
+            cosine(doc.vector, center)
+          )
         );
 
-        const distance = 1 - nearest;
+        const distance = 1 - closest;
 
         if (distance > bestDistance) {
           bestDistance = distance;
-          bestDoc = doc;
+          best = doc;
         }
-      }
+      });
 
-      if (!bestDoc) break;
-      centroids.push(bestDoc.vector);
+      if (!best) break;
+
+      centroids.push(best.vector);
     }
 
     let assignments = new Array(usefulDocs.length).fill(-1);
 
-    // Spherical k-means.
-    for (let iteration = 0; iteration < 18; iteration++) {
+    // Spherical K-means clustering.
+    for (let iteration = 0; iteration < 25; iteration++) {
       let changed = false;
 
       usefulDocs.forEach((doc, index) => {
@@ -287,113 +328,188 @@
         }
       });
 
-      for (let cluster = 0; cluster < centroids.length; cluster++) {
-        const centroid = makeCentroid(
+      for (let cluster = 0; cluster < k; cluster++) {
+        const updated = centroidFor(
           usefulDocs,
           assignments,
           cluster
         );
 
-        if (centroid.size) {
-          centroids[cluster] = centroid;
+        if (updated.size) {
+          centroids[cluster] = updated;
         }
       }
 
       if (!changed) break;
     }
 
-    // Build readable labels from repeated terms.
     const groups = [];
 
-    for (let cluster = 0; cluster < centroids.length; cluster++) {
+    for (let cluster = 0; cluster < k; cluster++) {
       const members = usefulDocs.filter(
         (_, index) => assignments[index] === cluster
       );
 
       if (members.length < 3) continue;
 
-      const termScores = new Map();
-      const termCounts = new Map();
+      const scores = new Map();
+      const occurrences = new Map();
 
       members.forEach(doc => {
-        for (const [word, value] of doc.vector) {
-          termScores.set(
+        doc.vector.forEach((value, word) => {
+          scores.set(
             word,
-            (termScores.get(word) || 0) + value
+            (scores.get(word) || 0) + value
           );
 
-          termCounts.set(
+          occurrences.set(
             word,
-            (termCounts.get(word) || 0) + 1
+            (occurrences.get(word) || 0) + 1
           );
-        }
+        });
       });
 
-      const keywords = [...termScores.entries()]
-        .filter(([word]) => termCounts.get(word) >= 2)
+      const keywords = [...scores.entries()]
+        .filter(([word]) => occurrences.get(word) >= 2)
         .sort((a, b) => b[1] - a[1])
         .slice(0, 2)
-        .map(([word]) =>
-          word.charAt(0).toUpperCase() + word.slice(1)
-        );
+        .map(([word]) => word.replace(/_/g, " "));
 
-      const name = keywords.length
-        ? keywords.join(" & ")
-        : "Other topics";
+      if (!keywords.length) continue;
+
+      const name = keywords
+        .map(word =>
+          word.charAt(0).toUpperCase() + word.slice(1)
+        )
+        .join(" & ");
 
       groups.push({
         name,
-        videos: members.map(doc => doc.video)
+        centroid: centroids[cluster],
+        sampleCount: members.length
       });
     }
 
-    // Titles with insufficient useful words go into Other.
-    const assignedIds = new Set(
-      groups.flatMap(group => group.videos.map(video => video.id))
-    );
+    // Ensure category names are unique.
+    const usedNames = new Map();
 
-    const unassigned = videos.filter(
-      video => !assignedIds.has(video.id)
-    );
+    groups.forEach(group => {
+      const base = group.name;
+      const count = (usedNames.get(base) || 0) + 1;
 
-    if (unassigned.length) {
-      groups.push({
-        name: "Other",
-        videos: unassigned
-      });
-    }
+      usedNames.set(base, count);
 
-    return groups.sort(
-      (a, b) => b.videos.length - a.videos.length
-    );
+      if (count > 1) {
+        group.name = `${base} ${count}`;
+      }
+    });
+
+    return { groups, allVectors, centroids };
   }
+
+  function classifyAllVideos(allVideos, discovery) {
+    const { groups, allVectors } = discovery;
+
+    allVideos.forEach(video => {
+      const vector = allVectors.get(video.id);
+
+      if (!vector || !vector.size || !groups.length) {
+        video.category = "Other";
+        return;
+      }
+
+      let bestGroup = null;
+      let bestScore = -1;
+
+      groups.forEach(group => {
+        const score = cosine(vector, group.centroid);
+
+        if (score > bestScore) {
+          bestScore = score;
+          bestGroup = group;
+        }
+      });
+
+      // Avoid assigning unrelated titles to an arbitrary topic.
+      video.category =
+        bestGroup && bestScore >= 0.08
+          ? bestGroup.name
+          : "Other";
+    });
+
+    const results = groups.map(group => ({
+      name: group.name,
+      videos: allVideos.filter(
+        video => video.category === group.name
+      )
+    }));
+
+    const otherVideos = allVideos.filter(
+      video => video.category === "Other"
+    );
+
+    if (otherVideos.length) {
+      results.push({
+        name: "Other",
+        videos: otherVideos
+      });
+    }
+
+    return results
+      .filter(group => group.videos.length > 0)
+      .sort((a, b) => b.videos.length - a.videos.length);
+  }
+
+  // -------------------------------
+  // INTERFACE
+  // -------------------------------
 
   function createInterface() {
     const existing = document.getElementById(ROOT_ID);
+
     if (existing) return existing;
 
     const root = document.createElement("section");
     root.id = ROOT_ID;
+    root.dataset.view = viewMode;
 
     root.innerHTML = `
       <div class="ww-heading">
         <div>
+          <div class="ww-eyebrow">YOUR PERSONAL VIDEO ORGANIZER</div>
           <h2>WatchWise</h2>
-          <p class="ww-status">Ready to organize your playlist.</p>
+          <p class="ww-status">
+            Discover topics from your Watch Later playlist.
+          </p>
         </div>
-        <button class="ww-scan" type="button">
-          Scan playlist
-        </button>
+
+        <div class="ww-controls">
+          <button class="ww-scan" type="button">
+            Scan playlist
+          </button>
+
+          <div class="ww-view-toggle">
+            <button class="ww-view-btn ww-selected"
+              data-view="grid" type="button">Grid</button>
+            <button class="ww-view-btn"
+              data-view="list" type="button">List</button>
+          </div>
+        </div>
       </div>
 
       <div class="ww-filters"></div>
       <div class="ww-grid"></div>
     `;
 
-    const contents = getPlaylistContents();
+    playlistContents = getContents();
 
-    if (contents) {
-      contents.parentElement.insertBefore(root, contents);
+    if (playlistContents?.parentElement) {
+      playlistContents.parentElement.insertBefore(
+        root,
+        playlistContents
+      );
+    } else {
+      return null;
     }
 
     root.querySelector(".ww-scan").addEventListener(
@@ -401,70 +517,21 @@
       scanPlaylist
     );
 
+    root.querySelectorAll(".ww-view-btn").forEach(button => {
+      button.addEventListener("click", () => {
+        viewMode = button.dataset.view;
+        root.dataset.view = viewMode;
+
+        root.querySelectorAll(".ww-view-btn").forEach(btn => {
+          btn.classList.toggle(
+            "ww-selected",
+            btn === button
+          );
+        });
+      });
+    });
+
     return root;
-  }
-
-  function renderResults() {
-    const root = document.getElementById(ROOT_ID);
-    if (!root) return;
-
-    const filters = root.querySelector(".ww-filters");
-    const grid = root.querySelector(".ww-grid");
-
-    filters.replaceChildren();
-    grid.replaceChildren();
-
-    const allButton = makeChip(
-      `All (${collectedVideos.size})`,
-      "all"
-    );
-
-    filters.appendChild(allButton);
-
-    categories.forEach(category => {
-      filters.appendChild(
-        makeChip(
-          `${category.name} (${category.videos.length})`,
-          category.name
-        )
-      );
-    });
-
-    const selectedVideos = activeCategory === "all"
-      ? [...collectedVideos.values()]
-      : categories.find(
-          category => category.name === activeCategory
-        )?.videos || [];
-
-    selectedVideos.forEach(video => {
-      const card = document.createElement("a");
-      card.className = "ww-card";
-      card.href = video.url;
-      card.title = video.title;
-
-      const image = document.createElement("img");
-      image.className = "ww-thumbnail";
-      image.alt = "";
-      image.loading = "lazy";
-      image.src = video.thumbnail;
-
-      const title = document.createElement("h3");
-      title.textContent = video.title;
-
-      card.append(image, title);
-
-      if (video.duration) {
-        const duration = document.createElement("span");
-        duration.className = "ww-duration";
-        duration.textContent = video.duration;
-        card.appendChild(duration);
-      }
-
-      grid.appendChild(card);
-    });
-
-    root.querySelector(".ww-status").textContent =
-      `${selectedVideos.length} videos · ${categories.length} discovered topics`;
   }
 
   function makeChip(label, category) {
@@ -484,7 +551,6 @@
     );
 
     button.addEventListener("click", () => {
-      // Only change the local view. Never scan YouTube here.
       activeCategory = category;
       renderResults();
     });
@@ -492,13 +558,105 @@
     return button;
   }
 
+  function renderResults() {
+    const root = document.getElementById(ROOT_ID);
+    if (!root) return;
+
+    const filters = root.querySelector(".ww-filters");
+    const grid = root.querySelector(".ww-grid");
+
+    filters.replaceChildren();
+    grid.replaceChildren();
+
+    filters.appendChild(
+      makeChip(`All (${videos.size})`, "all")
+    );
+
+    categories.forEach(category => {
+      filters.appendChild(
+        makeChip(
+          `${category.name} (${category.videos.length})`,
+          category.name
+        )
+      );
+    });
+
+    const selectedVideos = activeCategory === "all"
+      ? [...videos.values()]
+      : categories.find(
+          category => category.name === activeCategory
+        )?.videos || [];
+
+    const fragment = document.createDocumentFragment();
+
+    selectedVideos.forEach(video => {
+      const card = document.createElement("a");
+
+      card.className = "ww-card";
+      card.href = video.url;
+      card.target = "_blank";
+      card.rel = "noopener noreferrer";
+      card.title = video.title;
+
+      const image = document.createElement("img");
+
+      image.className = "ww-thumbnail";
+      image.alt = "";
+      image.loading = "lazy";
+      image.src = video.thumbnail;
+
+      image.addEventListener("error", () => {
+        if (!image.dataset.fallback) {
+          image.dataset.fallback = "true";
+          image.src =
+            `https://i.ytimg.com/vi/${video.id}/mqdefault.jpg`;
+        } else {
+          image.style.visibility = "hidden";
+        }
+      });
+
+      const details = document.createElement("div");
+      details.className = "ww-card-details";
+
+      const title = document.createElement("h3");
+      title.textContent = video.title;
+
+      const meta = document.createElement("p");
+      meta.className = "ww-card-meta";
+      meta.textContent = [
+        video.duration,
+        video.category
+      ].filter(Boolean).join(" · ");
+
+      details.append(title, meta);
+      card.append(image, details);
+
+      fragment.appendChild(card);
+    });
+
+    grid.appendChild(fragment);
+
+    root.querySelector(".ww-status").textContent =
+      `${selectedVideos.length} videos shown · ` +
+      `${categories.length} discovered topics · ` +
+      `${videos.size} collected`;
+  }
+
+  // -------------------------------
+  // PLAYLIST SCANNER
+  // -------------------------------
+
+  function getScrollElement() {
+    return document.scrollingElement || document.documentElement;
+  }
+
   async function scanPlaylist() {
     if (scanning) return;
 
     const root = document.getElementById(ROOT_ID);
-    const contents = getPlaylistContents();
+    playlistContents = getContents();
 
-    if (!root || !contents) return;
+    if (!root || !playlistContents) return;
 
     scanning = true;
 
@@ -508,65 +666,144 @@
     button.disabled = true;
     button.textContent = "Scanning...";
 
+    // Allow a fresh scan after revealing the native playlist.
+    playlistContents.classList.remove("ww-native-hidden");
+
+    videos.clear();
+    categories = [];
+    activeCategory = "all";
+
+    const scrollElement = getScrollElement();
     const originalScroll = window.scrollY;
+
     let unchangedRounds = 0;
     let rounds = 0;
+    let lastHeight = 0;
 
     try {
-      // Keep collecting as YouTube loads additional playlist rows.
-      while (rounds < 300 && unchangedRounds < 8) {
+      while (rounds < MAX_ROUNDS) {
         const added = collectVisibleVideos();
 
-        unchangedRounds = added
-          ? 0
-          : unchangedRounds + 1;
+        if (added > 0) {
+          unchangedRounds = 0;
+        } else {
+          unchangedRounds++;
+        }
+
+        const currentHeight = scrollElement.scrollHeight;
 
         status.textContent =
-          `Collecting videos... ${collectedVideos.size} found`;
+          `Collecting playlist... ${videos.size} videos found`;
 
         const atBottom =
           window.innerHeight + window.scrollY >=
-          document.documentElement.scrollHeight - 150;
+          currentHeight - 180;
 
-        if (atBottom && unchangedRounds >= 3) break;
+        if (atBottom) {
+          // Give YouTube time to load the next batch.
+          await wait(1000);
 
-        window.scrollBy({
-          top: Math.max(500, window.innerHeight * 0.75),
-          behavior: "instant"
-        });
+          const newlyAdded = collectVisibleVideos();
 
-        await wait(400);
+          if (newlyAdded > 0) {
+            unchangedRounds = 0;
+          } else {
+            unchangedRounds++;
+          }
+
+          const newHeight = scrollElement.scrollHeight;
+
+          if (
+            unchangedRounds >= 12 &&
+            newHeight <= currentHeight
+          ) {
+            break;
+          }
+        } else {
+          window.scrollBy({
+            top: Math.max(500, window.innerHeight * 0.8),
+            behavior: "instant"
+          });
+
+          await wait(650);
+        }
+
+        if (currentHeight !== lastHeight) {
+          lastHeight = currentHeight;
+        }
+
         rounds++;
       }
 
       collectVisibleVideos();
 
-      const videos = [...collectedVideos.values()];
+      const allVideos = [...videos.values()];
 
-      if (videos.length < 8) {
+      if (allVideos.length < 15) {
         status.textContent =
-          `Only ${videos.length} videos collected. Scroll and try again.`;
+          `Only ${allVideos.length} videos found. ` +
+          `Please check that Watch Later is fully loaded.`;
         return;
       }
 
-      status.textContent = "Discovering topics...";
+      status.textContent =
+        `Discovering topics from ${Math.min(
+          SAMPLE_SIZE,
+          allVideos.length
+        )} sample videos...`;
 
-      categories = discoverTopics(videos);
+      // Use a deterministic sample spread across the collection.
+      const sample = allVideos.length <= SAMPLE_SIZE
+        ? allVideos
+        : Array.from(
+            { length: SAMPLE_SIZE },
+            (_, index) => {
+              const position = Math.floor(
+                index * (allVideos.length - 1) /
+                (SAMPLE_SIZE - 1)
+              );
+
+              return allVideos[position];
+            }
+          );
+
+      const discovery = discoverTopics(sample, allVideos);
+
+      if (!discovery.groups.length) {
+        status.textContent =
+          "Not enough repeated title keywords to discover topics.";
+        return;
+      }
+
+      status.textContent =
+        "Classifying all collected videos...";
+
+      categories = classifyAllVideos(
+        allVideos,
+        discovery
+      );
+
       activeCategory = "all";
 
-      // Hide the native list only after collection is complete.
-      contents.classList.add("ww-native-hidden");
+      // Hide YouTube's original list only after collection.
+      playlistContents.classList.add("ww-native-hidden");
 
       renderResults();
 
-      button.textContent = "Scan again";
-      status.textContent =
-        `${videos.length} videos organized into ${categories.length} topics`;
+      button.textContent = "Rescan playlist";
     } catch (error) {
-      console.error("WatchWise scan error:", error);
-      status.textContent = "Scan failed. Check the browser console.";
+      console.error("WatchWise V3 error:", error);
+
+      status.textContent =
+        "Something went wrong. Check the browser console.";
+
+      playlistContents?.classList.remove("ww-native-hidden");
     } finally {
-      window.scrollTo(0, originalScroll);
+      window.scrollTo({
+        top: originalScroll,
+        behavior: "instant"
+      });
+
       scanning = false;
       button.disabled = false;
 
@@ -576,36 +813,54 @@
     }
   }
 
-  function initialize() {
-    if (
-      new URLSearchParams(location.search).get("list") !== "WL"
-    ) return;
+  // -------------------------------
+  // INITIALIZATION / NAVIGATION
+  // -------------------------------
 
-    if (!getPlaylistContents()) return;
+  function reset() {
+    playlistContents?.classList.remove("ww-native-hidden");
+
+    document.getElementById(ROOT_ID)?.remove();
+
+    videos.clear();
+    categories = [];
+    activeCategory = "all";
+    scanning = false;
+    playlistContents = null;
+  }
+
+  function initialize() {
+    if (!isWatchLater()) return;
+
+    if (document.getElementById(ROOT_ID)) return;
+
+    const contents = getContents();
+
+    if (!contents) return;
 
     createInterface();
   }
 
-  // Initialize after YouTube has rendered the playlist.
-  initialize();
+  function handleNavigation() {
+    reset();
 
-  let previousUrl = location.href;
+    if (isWatchLater()) {
+      setTimeout(initialize, 700);
+      setTimeout(initialize, 1800);
+    }
+  }
 
-  setInterval(() => {
-    if (location.href === previousUrl) return;
+  // Initial page.
+  setTimeout(initialize, 700);
 
-    previousUrl = location.href;
+  // YouTube single-page navigation.
+  document.addEventListener(
+    "yt-navigate-finish",
+    handleNavigation
+  );
 
-    collectedVideos.clear();
-    categories = [];
-    activeCategory = "all";
-
-    document.getElementById(ROOT_ID)?.remove();
-
-    document.querySelectorAll(".ww-native-hidden").forEach(element => {
-      element.classList.remove("ww-native-hidden");
-    });
-
-    initialize();
-  }, 700);
+  window.addEventListener(
+    "popstate",
+    handleNavigation
+  );
 })();
