@@ -1,20 +1,29 @@
 
 (() => {
-  if (window.__watchwiseV3) return;
-  window.__watchwiseV3 = true;
+  "use strict";
 
-  const ROOT_ID = "watchwise-root";
-  const ROW_SELECTOR = "ytd-playlist-video-renderer";
+  if (window.__WATCHWISE_V7__) return;
+  window.__WATCHWISE_V7__ = true;
+
+  // SETTINGS
   const SAMPLE_SIZE = 200;
-  const MAX_ROUNDS = 1200;
+  const MAX_PAGES = 500;
+  const PAGE_DELAY = 300;
+  const RENDER_EVERY = 2;
 
-  const videos = new Map();
-
+  let videos = new Map();
   let categories = [];
-  let activeCategory = "all";
-  let scanning = false;
-  let viewMode = "grid";
-  let playlistContents = null;
+  let vocabulary = new Map();
+  let continuation = null;
+  let clickTrackingParams = null;
+  let selectedCategory = "All";
+  let nativePlaylist = null;
+  let fullLoaded = false;
+  let loading = false;
+  let loadError = null;
+  let stopped = false;
+
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
   const STOP_WORDS = new Set(`
     the and for with from into about your this that what when
@@ -26,86 +35,587 @@
     everything something really very more most only also
     my me i we he she it a an to of in on at by as is be
     do did does if or so up out over after before
-    please like subscribe channel music song songs
-  `.split(/\s+/));
-
-  const wait = ms =>
-    new Promise(resolve => setTimeout(resolve, ms));
+    please like subscribe channel playlist youtube
+    day days week weeks hour hours
+  `.trim().split(/\s+/));
 
   function isWatchLater() {
     return new URLSearchParams(location.search).get("list") === "WL";
   }
 
-  function getContents() {
-    return document.querySelector(
-      "ytd-playlist-video-list-renderer #contents"
-    );
+  // --------------------------------
+  // SAFE OBJECT SEARCH
+  // --------------------------------
+
+  function findAll(object, key, output = [], seen = new WeakSet()) {
+    if (!object || typeof object !== "object" || seen.has(object)) {
+      return output;
+    }
+
+    seen.add(object);
+
+    if (Object.prototype.hasOwnProperty.call(object, key)) {
+      output.push(object[key]);
+    }
+
+    for (const value of Object.values(object)) {
+      if (value && typeof value === "object") {
+        findAll(value, key, output, seen);
+      }
+    }
+
+    return output;
   }
 
-  function getVideoId(href) {
-    try {
-      const url = new URL(href, location.origin);
+  function findFirst(object, key) {
+    return findAll(object, key)[0] || null;
+  }
 
-      return url.searchParams.get("v") ||
-        url.pathname.match(/\/shorts\/([^/?]+)/)?.[1] ||
-        null;
-    } catch {
-      return null;
+  function getText(value) {
+    if (!value) return "";
+
+    if (typeof value === "string") return value;
+
+    if (value.simpleText) return value.simpleText;
+
+    if (typeof value.content === "string") {
+      return value.content;
+    }
+
+    if (value.runs) {
+      return value.runs.map(x => x.text || "").join("");
+    }
+
+    return "";
+  }
+
+  // --------------------------------
+  // VIDEO EXTRACTION
+  // Supports:
+  // - playlistVideoRenderer (older YouTube)
+  // - lockupViewModel (newer YouTube)
+  // --------------------------------
+
+  function addVideoData(id, title, thumbnail, duration) {
+    if (!id || !title || videos.has(id)) return;
+
+    videos.set(id, {
+      id,
+      title,
+      thumbnail:
+        thumbnail ||
+        `https://i.ytimg.com/vi/${id}/mqdefault.jpg`,
+      duration: duration || "",
+      url: `https://www.youtube.com/watch?v=${id}`,
+      category: "Other"
+    });
+  }
+
+  function addOldVideo(renderer) {
+    if (!renderer) return;
+
+    const id = renderer.videoId;
+    const title = getText(renderer.title).trim();
+
+    if (!id || !title) return;
+
+    const thumbs = renderer.thumbnail?.thumbnails || [];
+
+    const thumbnail = thumbs.length
+      ? thumbs[thumbs.length - 1].url
+      : "";
+
+    const duration =
+      getText(renderer.lengthText) ||
+      getText(
+        renderer.thumbnailOverlays?.find(
+          x => x.thumbnailOverlayTimeStatusRenderer
+        )?.thumbnailOverlayTimeStatusRenderer?.text
+      );
+
+    addVideoData(id, title, thumbnail, duration);
+  }
+
+  function addLockupVideo(lockup) {
+    if (!lockup) return;
+
+    const id =
+      lockup.contentId ||
+      lockup.videoId ||
+      lockup.content_id;
+
+    const metadata = lockup.metadata?.lockupMetadataViewModel;
+
+    const title =
+      getText(metadata?.title) ||
+      getText(lockup.title) ||
+      getText(lockup.accessibilityText);
+
+    if (!id || !title) return;
+
+    // New YouTube thumbnail format.
+    const thumbnailSources = findAll(
+      lockup.contentImage || {},
+      "url"
+    );
+
+    const thumbnail =
+      thumbnailSources
+        .filter(url =>
+          typeof url === "string" &&
+          url.startsWith("http")
+        )
+        .at(-1) || "";
+
+    // New YouTube duration badge format.
+    const badges = findAll(
+      lockup.contentImage || {},
+      "thumbnailBadgeViewModel"
+    );
+
+    let duration = "";
+
+    for (const badge of badges) {
+      const text = getText(badge.text);
+
+      if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(text)) {
+        duration = text;
+        break;
+      }
+    }
+
+    // Older overlay fallback.
+    if (!duration) {
+      const overlays = findAll(
+        lockup,
+        "thumbnailOverlayTimeStatusRenderer"
+      );
+
+      for (const overlay of overlays) {
+        const text = getText(overlay?.text);
+
+        if (text) {
+          duration = text;
+          break;
+        }
+      }
+    }
+
+    addVideoData(id, title, thumbnail, duration);
+  }
+
+  function extractVideoFromItem(item) {
+    if (!item || typeof item !== "object") return;
+
+    if (item.playlistVideoRenderer) {
+      addOldVideo(item.playlistVideoRenderer);
+    }
+
+    if (item.lockupViewModel) {
+      addLockupVideo(item.lockupViewModel);
+    }
+
+    // Some YouTube layouts wrap their items.
+    if (item.richItemRenderer?.content) {
+      extractVideoFromItem(item.richItemRenderer.content);
+    }
+
+    if (item.itemSectionRenderer?.contents) {
+      extractVideosFromItems(item.itemSectionRenderer.contents);
     }
   }
 
-  function getDuration(row) {
-    const text = [
-      ...row.querySelectorAll(
-        "ytd-thumbnail-overlay-time-status-renderer, " +
-        "ytd-thumbnail-overlay-time-status-renderer span, " +
-        "ytd-thumbnail-overlay-time-status-renderer #text"
-      )
-    ]
-      .map(element => element.textContent || "")
-      .join(" ");
+  function extractVideosFromItems(items) {
+    if (!Array.isArray(items)) return 0;
 
-    return text.match(/\b\d{1,2}:\d{2}(?::\d{2})?\b/)?.[0] || "";
+    const before = videos.size;
+
+    for (const item of items) {
+      extractVideoFromItem(item);
+    }
+
+    return videos.size - before;
   }
 
-  function collectVisibleVideos() {
-    let added = 0;
+  // --------------------------------
+  // CONTINUATION EXTRACTION
+  //
+  // IMPORTANT:
+  // Only inspect the continuation item belonging
+  // to the actual playlist video list.
+  //
+  // Do not use unrelated section-level tokens.
+  // --------------------------------
 
-    document.querySelectorAll(ROW_SELECTOR).forEach(row => {
-      const link = row.querySelector(
-        "a#video-title, a#video-title-link"
+  function tokenFromContinuationItem(item) {
+    if (!item || typeof item !== "object") {
+      return null;
+    }
+
+    // Older format.
+    const oldCommand =
+      item.continuationItemRenderer
+        ?.continuationEndpoint
+        ?.continuationCommand;
+
+    if (oldCommand?.token) {
+      return {
+        token: oldCommand.token,
+        clickTrackingParams:
+          item.continuationItemRenderer
+            ?.continuationEndpoint
+            ?.clickTrackingParams ||
+          null
+      };
+    }
+
+    // Newer format:
+    // continuationItemViewModel
+    //   .continuationCommand
+    //   .innertubeCommand
+    //   .continuationCommand
+    //   .token
+
+    const model = item.continuationItemViewModel;
+
+    if (model) {
+      const command = model.continuationCommand;
+
+      const nested =
+        command?.innertubeCommand?.continuationCommand;
+
+      if (nested?.token) {
+        return {
+          token: nested.token,
+          clickTrackingParams:
+            command?.innertubeCommand?.clickTrackingParams ||
+            command?.clickTrackingParams ||
+            model.clickTrackingParams ||
+            null
+        };
+      }
+
+      if (command?.token) {
+        return {
+          token: command.token,
+          clickTrackingParams:
+            model.clickTrackingParams || null
+        };
+      }
+
+      // Fallback for experiments that move the nested command.
+      const nestedCommands = findAll(
+        model,
+        "continuationCommand"
       );
 
-      if (!link) return;
+      for (const candidate of nestedCommands) {
+        if (candidate?.token) {
+          return {
+            token: candidate.token,
+            clickTrackingParams:
+              model.clickTrackingParams || null
+          };
+        }
+      }
+    }
 
-      const title = (
-        link.getAttribute("title") ||
-        link.textContent ||
-        ""
-      ).replace(/\s+/g, " ").trim();
-
-      const id = getVideoId(link.href);
-
-      if (!id || !title || videos.has(id)) return;
-
-      videos.set(id, {
-        id,
-        title,
-        url: `https://www.youtube.com/watch?v=${id}`,
-        thumbnail: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`,
-        duration: getDuration(row),
-        category: "Other"
-      });
-
-      added++;
-    });
-
-    return added;
+    return null;
   }
 
-  // -------------------------------
-  // TITLE ANALYSIS
-  // -------------------------------
+  function continuationFromItems(items) {
+    if (!Array.isArray(items)) return null;
+
+    // The playlist continuation is normally the last item.
+    // Search backwards, but only within this playlist's items.
+    for (let i = items.length - 1; i >= 0; i--) {
+      const result = tokenFromContinuationItem(items[i]);
+
+      if (result) return result;
+    }
+
+    return null;
+  }
+
+  function extractOldPlaylist(data) {
+    const lists = findAll(data, "playlistVideoListRenderer");
+
+    for (const playlist of lists) {
+      if (!Array.isArray(playlist?.contents)) continue;
+
+      const before = videos.size;
+      extractVideosFromItems(playlist.contents);
+
+      if (videos.size > before || playlist.contents.length) {
+        const next =
+          continuationFromItems(playlist.contents);
+
+        if (next) return next;
+
+        if (playlist.continuations?.length) {
+          const oldToken =
+            playlist.continuations[0]
+              ?.nextContinuationData?.continuation;
+
+          if (oldToken) {
+            return {
+              token: oldToken,
+              clickTrackingParams: null
+            };
+          }
+        }
+
+        return null;
+      }
+    }
+
+    return null;
+  }
+
+  function extractNewPlaylist(data) {
+    const sectionLists = findAll(data, "sectionListRenderer");
+
+    for (const sectionList of sectionLists) {
+      const sections = sectionList?.contents;
+
+      if (!Array.isArray(sections)) continue;
+
+      for (const section of sections) {
+        const itemSection = section?.itemSectionRenderer;
+
+        if (!itemSection || !Array.isArray(itemSection.contents)) {
+          continue;
+        }
+
+        const items = itemSection.contents;
+        const before = videos.size;
+
+        extractVideosFromItems(items);
+
+        // Only accept a section containing actual playlist videos.
+        if (videos.size === before) continue;
+
+        // This is the important part:
+        // use the token INSIDE itemSectionRenderer.contents.
+        // Do not use a sibling token in sectionListRenderer.contents.
+        return continuationFromItems(items);
+      }
+    }
+
+    return null;
+  }
+
+  function readInitialPlaylist(data) {
+    // Prefer the old, explicit playlist renderer when available.
+    let next = extractOldPlaylist(data);
+
+    if (!next) {
+      next = extractNewPlaylist(data);
+    }
+
+    if (next) {
+      continuation = next.token;
+      clickTrackingParams = next.clickTrackingParams;
+    }
+
+    console.log("WatchWise initial videos:", videos.size);
+    console.log(
+      "WatchWise playlist continuation:",
+      Boolean(continuation)
+    );
+
+    return videos.size > 0;
+  }
+
+  // --------------------------------
+  // CONTINUATION RESPONSE EXTRACTION
+  // --------------------------------
+
+  function getContinuationItems(data) {
+    // Standard modern and older append response.
+    const appendActions = findAll(
+      data,
+      "appendContinuationItemsAction"
+    );
+
+    for (let i = appendActions.length - 1; i >= 0; i--) {
+      const items = appendActions[i]?.continuationItems;
+
+      if (Array.isArray(items)) return items;
+    }
+
+    // Alternate response command.
+    const reloadCommands = findAll(
+      data,
+      "reloadContinuationItemsCommand"
+    );
+
+    for (let i = reloadCommands.length - 1; i >= 0; i--) {
+      const items = reloadCommands[i]?.continuationItems;
+
+      if (Array.isArray(items)) return items;
+    }
+
+    // Older continuationContents response.
+    const oldLists = findAll(
+      data,
+      "playlistVideoListContinuation"
+    );
+
+    for (const list of oldLists) {
+      if (Array.isArray(list?.contents)) {
+        return list.contents;
+      }
+    }
+
+    // Some responses expose itemSectionContinuation.
+    const sectionContinuations = findAll(
+      data,
+      "itemSectionContinuation"
+    );
+
+    for (const section of sectionContinuations) {
+      if (Array.isArray(section?.contents)) {
+        return section.contents;
+      }
+    }
+
+    return null;
+  }
+
+  // --------------------------------
+  // YOUTUBE BACKGROUND API
+  // --------------------------------
+
+  function getYouTubeConfig() {
+    const config = window.ytcfg;
+
+    if (!config?.get) {
+      throw new Error("YouTube configuration is unavailable.");
+    }
+
+    const apiKey = config.get("INNERTUBE_API_KEY");
+    const context = config.get("INNERTUBE_CONTEXT");
+
+    if (!apiKey || !context) {
+      throw new Error("YouTube API configuration is incomplete.");
+    }
+
+    return {
+      apiKey,
+      context,
+      clientName: config.get("INNERTUBE_CLIENT_NAME") || 1,
+      clientVersion: config.get("INNERTUBE_CLIENT_VERSION") || "",
+      visitorData: config.get("VISITOR_DATA")
+    };
+  }
+
+  async function fetchNextPage() {
+    if (!continuation) return false;
+
+    const config = getYouTubeConfig();
+
+    const oldToken = continuation;
+    const oldCount = videos.size;
+
+    const endpoint =
+      `/youtubei/v1/browse?prettyPrint=false&key=${encodeURIComponent(config.apiKey)}`;
+
+    const headers = {
+      "Content-Type": "application/json",
+      "X-YouTube-Client-Name": String(config.clientName),
+      "X-YouTube-Client-Version": config.clientVersion,
+      "X-Origin": location.origin
+    };
+
+    if (config.visitorData) {
+      headers["X-Goog-Visitor-Id"] = config.visitorData;
+    }
+
+    const body = {
+      context: config.context,
+      continuation: oldToken
+    };
+
+    if (clickTrackingParams) {
+      body.clickTracking = {
+        clickTrackingParams
+      };
+    }
+
+    const response = await fetch(endpoint, {
+      method: "POST",
+      credentials: "include",
+      headers,
+      body: JSON.stringify(body),
+      referrer: location.href
+    });
+
+    if (!response.ok) {
+      throw new Error(
+        `YouTube API returned HTTP ${response.status}.`
+      );
+    }
+
+    const data = await response.json();
+
+    // Extract only the actual continuation page items.
+    const items = getContinuationItems(data);
+
+    if (!items) {
+      console.error(
+        "WatchWise unexpected continuation response:",
+        data
+      );
+
+      throw new Error(
+        "YouTube returned an unfamiliar continuation response. Open the console for details."
+      );
+    }
+
+    const count = extractVideosFromItems(items);
+    const next = continuationFromItems(items);
+
+    if (count === 0) {
+      console.error(
+        "WatchWise received continuation items but found no playlist videos:",
+        items
+      );
+
+      throw new Error(
+        "YouTube returned a page without recognizable playlist videos. Check the console."
+      );
+    }
+
+    if (!next) {
+      continuation = null;
+      clickTrackingParams = null;
+    } else if (next.token === oldToken) {
+      throw new Error(
+        "YouTube repeated a continuation token. Stopping to prevent an infinite loop."
+      );
+    } else {
+      continuation = next.token;
+      clickTrackingParams = next.clickTrackingParams;
+    }
+
+    console.log(
+      "WatchWise page:",
+      count,
+      "new videos;",
+      videos.size,
+      "unique videos collected;",
+      "next page:",
+      Boolean(continuation)
+    );
+
+    return videos.size > oldCount;
+  }
+
+  // --------------------------------
+  // DYNAMIC CATEGORY DISCOVERY
+  // ORIGINAL ALGORITHM PRESERVED
+  // --------------------------------
 
   function tokenize(title) {
     const words = title
@@ -119,14 +629,13 @@
         !/^\d+$/.test(word)
       );
 
-    const tokens = [...words];
+    const result = [...words];
 
-    // Include adjacent word pairs for more descriptive topics.
     for (let i = 0; i < words.length - 1; i++) {
-      tokens.push(`${words[i]}_${words[i + 1]}`);
+      result.push(`${words[i]}_${words[i + 1]}`);
     }
 
-    return tokens;
+    return result;
   }
 
   function normalize(vector) {
@@ -138,428 +647,373 @@
 
     magnitude = Math.sqrt(magnitude);
 
-    if (!magnitude) return vector;
-
-    for (const [word, value] of vector) {
-      vector.set(word, value / magnitude);
+    if (magnitude) {
+      for (const [key, value] of vector) {
+        vector.set(key, value / magnitude);
+      }
     }
 
     return vector;
   }
 
-  function cosine(a, b) {
-    let dot = 0;
+  function similarity(a, b) {
+    let score = 0;
 
-    for (const [word, value] of a) {
-      dot += value * (b.get(word) || 0);
-    }
+    a.forEach((value, key) => {
+      score += value * (b.get(key) || 0);
+    });
 
-    return dot;
+    return score;
   }
 
-  function buildVectors(sample, allVideos) {
-    const docs = sample.map(video => ({
-      video,
-      tokens: tokenize(video.title),
-      vector: new Map()
-    }));
+  function vectorize(title) {
+    const counts = new Map();
 
-    const df = new Map();
-
-    docs.forEach(doc => {
-      for (const token of new Set(doc.tokens)) {
-        df.set(token, (df.get(token) || 0) + 1);
+    tokenize(title).forEach(word => {
+      if (vocabulary.has(word)) {
+        counts.set(word, (counts.get(word) || 0) + 1);
       }
     });
 
-    const minimumFrequency = Math.max(
-      2,
-      Math.ceil(sample.length * 0.01)
-    );
+    const vector = new Map();
 
-    const vocabulary = new Set(
-      [...df.entries()]
-        .filter(([, count]) => count >= minimumFrequency)
-        .map(([word]) => word)
-    );
-
-    function vectorize(title) {
-      const tokens = tokenize(title);
-      const counts = new Map();
-
-      tokens.forEach(token => {
-        if (vocabulary.has(token)) {
-          counts.set(token, (counts.get(token) || 0) + 1);
-        }
-      });
-
-      const vector = new Map();
-
-      counts.forEach((count, word) => {
-        const inverseFrequency = Math.log(
-          1 + sample.length / (1 + df.get(word))
-        );
-
-        vector.set(
-          word,
-          (1 + Math.log(count)) * inverseFrequency
-        );
-      });
-
-      return normalize(vector);
-    }
-
-    docs.forEach(doc => {
-      doc.vector = vectorize(doc.video.title);
+    counts.forEach((count, word) => {
+      vector.set(
+        word,
+        (1 + Math.log(count)) * vocabulary.get(word)
+      );
     });
 
-    const allVectors = new Map();
-
-    allVideos.forEach(video => {
-      allVectors.set(video.id, vectorize(video.title));
-    });
-
-    return { docs, allVectors };
+    return normalize(vector);
   }
 
-  function centroidFor(docs, assignments, cluster) {
-    const centroid = new Map();
-    let count = 0;
+  function centroid(documents) {
+    const result = new Map();
 
-    docs.forEach((doc, index) => {
-      if (assignments[index] !== cluster) return;
-
-      count++;
-
+    documents.forEach(doc => {
       doc.vector.forEach((value, word) => {
-        centroid.set(
-          word,
-          (centroid.get(word) || 0) + value
-        );
+        result.set(word, (result.get(word) || 0) + value);
       });
     });
 
-    if (!count) return centroid;
-
-    centroid.forEach((value, word) => {
-      centroid.set(word, value / count);
+    result.forEach((value, word) => {
+      result.set(word, value / documents.length);
     });
 
-    return normalize(centroid);
+    return normalize(result);
   }
 
-  // -------------------------------
-  // AUTOMATIC TOPIC DISCOVERY
-  // -------------------------------
+  function discoverTopics(sample) {
+    const frequency = new Map();
 
-  function discoverTopics(sample, allVideos) {
-    const { docs, allVectors } = buildVectors(
-      sample,
-      allVideos
+    sample.forEach(video => {
+      new Set(tokenize(video.title)).forEach(word => {
+        frequency.set(word, (frequency.get(word) || 0) + 1);
+      });
+    });
+
+    vocabulary = new Map(
+      [...frequency.entries()]
+        .filter(([word, count]) =>
+          count >= Math.max(2, Math.ceil(sample.length * 0.015)) &&
+          count <= sample.length * 0.65
+        )
+        .map(([word, count]) => [
+          word,
+          Math.log(1 + sample.length / (1 + count))
+        ])
     );
 
-    const usefulDocs = docs.filter(
-      doc => doc.vector.size > 0
-    );
+    const documents = sample.map(video => ({
+      video,
+      vector: vectorize(video.title)
+    })).filter(doc => doc.vector.size);
 
-    if (usefulDocs.length < 15) {
-      return {
-        groups: [],
-        allVectors,
-        centroids: []
-      };
+    if (documents.length < 15) {
+      throw new Error("Not enough video titles to discover topics.");
     }
 
     const k = Math.min(
-      12,
-      Math.max(8, Math.round(usefulDocs.length / 20)),
-      Math.floor(usefulDocs.length / 5)
+      8,
+      Math.max(5, Math.round(Math.sqrt(documents.length / 5))),
+      Math.floor(documents.length / 4)
     );
 
-    // Deterministic farthest-first initialization.
-    const centroids = [usefulDocs[0].vector];
+    const centers = [documents[0].vector];
 
-    while (centroids.length < k) {
+    while (centers.length < k) {
       let best = null;
-      let bestDistance = -1;
+      let distance = -1;
 
-      usefulDocs.forEach(doc => {
+      documents.forEach(doc => {
         const closest = Math.max(
-          ...centroids.map(center =>
-            cosine(doc.vector, center)
-          )
+          ...centers.map(center => similarity(doc.vector, center))
         );
 
-        const distance = 1 - closest;
-
-        if (distance > bestDistance) {
-          bestDistance = distance;
-          best = doc;
+        if (1 - closest > distance) {
+          distance = 1 - closest;
+          best = doc.vector;
         }
       });
 
       if (!best) break;
-
-      centroids.push(best.vector);
+      centers.push(best);
     }
 
-    let assignments = new Array(usefulDocs.length).fill(-1);
+    const assignments = new Array(documents.length).fill(-1);
 
-    // Spherical K-means clustering.
     for (let iteration = 0; iteration < 25; iteration++) {
       let changed = false;
 
-      usefulDocs.forEach((doc, index) => {
-        let bestCluster = 0;
-        let bestScore = -1;
+      documents.forEach((doc, index) => {
+        let best = 0;
+        let score = -1;
 
-        centroids.forEach((center, cluster) => {
-          const score = cosine(doc.vector, center);
+        centers.forEach((center, cluster) => {
+          const current = similarity(doc.vector, center);
 
-          if (score > bestScore) {
-            bestScore = score;
-            bestCluster = cluster;
+          if (current > score) {
+            score = current;
+            best = cluster;
           }
         });
 
-        if (assignments[index] !== bestCluster) {
-          assignments[index] = bestCluster;
+        if (assignments[index] !== best) {
+          assignments[index] = best;
           changed = true;
         }
       });
 
-      for (let cluster = 0; cluster < k; cluster++) {
-        const updated = centroidFor(
-          usefulDocs,
-          assignments,
-          cluster
+      centers.forEach((_, cluster) => {
+        const members = documents.filter(
+          (_, index) => assignments[index] === cluster
         );
 
-        if (updated.size) {
-          centroids[cluster] = updated;
+        if (members.length) {
+          centers[cluster] = centroid(members);
         }
-      }
+      });
 
       if (!changed) break;
     }
 
-    const groups = [];
+    categories = [];
 
-    for (let cluster = 0; cluster < k; cluster++) {
-      const members = usefulDocs.filter(
+    centers.forEach((center, cluster) => {
+      const members = documents.filter(
         (_, index) => assignments[index] === cluster
       );
 
-      if (members.length < 3) continue;
+      if (members.length < 4) return;
 
       const scores = new Map();
-      const occurrences = new Map();
 
       members.forEach(doc => {
         doc.vector.forEach((value, word) => {
-          scores.set(
-            word,
-            (scores.get(word) || 0) + value
-          );
-
-          occurrences.set(
-            word,
-            (occurrences.get(word) || 0) + 1
-          );
+          scores.set(word, (scores.get(word) || 0) + value);
         });
       });
 
       const keywords = [...scores.entries()]
-        .filter(([word]) => occurrences.get(word) >= 2)
         .sort((a, b) => b[1] - a[1])
         .slice(0, 2)
         .map(([word]) => word.replace(/_/g, " "));
 
-      if (!keywords.length) continue;
+      if (!keywords.length) return;
 
-      const name = keywords
-        .map(word =>
-          word.charAt(0).toUpperCase() + word.slice(1)
-        )
-        .join(" & ");
+      const name = keywords.map(word =>
+        word.charAt(0).toUpperCase() + word.slice(1)
+      ).join(" & ");
 
-      groups.push({
+      categories.push({
         name,
-        centroid: centroids[cluster],
-        sampleCount: members.length
+        centroid: center
       });
-    }
-
-    // Ensure category names are unique.
-    const usedNames = new Map();
-
-    groups.forEach(group => {
-      const base = group.name;
-      const count = (usedNames.get(base) || 0) + 1;
-
-      usedNames.set(base, count);
-
-      if (count > 1) {
-        group.name = `${base} ${count}`;
-      }
     });
 
-    return { groups, allVectors, centroids };
-  }
+    const usedNames = new Set();
 
-  function classifyAllVideos(allVideos, discovery) {
-    const { groups, allVectors } = discovery;
+    categories.forEach(category => {
+      const base = category.name;
+      let name = base;
+      let number = 2;
 
-    allVideos.forEach(video => {
-      const vector = allVectors.get(video.id);
-
-      if (!vector || !vector.size || !groups.length) {
-        video.category = "Other";
-        return;
+      while (usedNames.has(name)) {
+        name = `${base} ${number++}`;
       }
 
-      let bestGroup = null;
+      category.name = name;
+      usedNames.add(name);
+    });
+  }
+
+  function classifyVideos() {
+    videos.forEach(video => {
+      const vector = vectorize(video.title);
+
+      let best = null;
       let bestScore = -1;
 
-      groups.forEach(group => {
-        const score = cosine(vector, group.centroid);
+      categories.forEach(category => {
+        const score = similarity(vector, category.centroid);
 
         if (score > bestScore) {
           bestScore = score;
-          bestGroup = group;
+          best = category;
         }
       });
 
-      // Avoid assigning unrelated titles to an arbitrary topic.
       video.category =
-        bestGroup && bestScore >= 0.08
-          ? bestGroup.name
+        best && bestScore >= 0.10
+          ? best.name
           : "Other";
     });
-
-    const results = groups.map(group => ({
-      name: group.name,
-      videos: allVideos.filter(
-        video => video.category === group.name
-      )
-    }));
-
-    const otherVideos = allVideos.filter(
-      video => video.category === "Other"
-    );
-
-    if (otherVideos.length) {
-      results.push({
-        name: "Other",
-        videos: otherVideos
-      });
-    }
-
-    return results
-      .filter(group => group.videos.length > 0)
-      .sort((a, b) => b.videos.length - a.videos.length);
   }
 
-  // -------------------------------
+  // --------------------------------
   // INTERFACE
-  // -------------------------------
+  // --------------------------------
+
+  function findNativePlaylist() {
+    return document.querySelector(
+      "ytd-playlist-video-list-renderer"
+    );
+  }
 
   function createInterface() {
-    const existing = document.getElementById(ROOT_ID);
+    const native = findNativePlaylist();
 
+    if (!native) return null;
+
+    const existing = document.getElementById("watchwise-root");
     if (existing) return existing;
 
+    nativePlaylist = native;
+
     const root = document.createElement("section");
-    root.id = ROOT_ID;
-    root.dataset.view = viewMode;
+    root.id = "watchwise-root";
+    root.dataset.view = "grid";
 
-    root.innerHTML = `
-      <div class="ww-heading">
-        <div>
-          <div class="ww-eyebrow">YOUR PERSONAL VIDEO ORGANIZER</div>
-          <h2>WatchWise</h2>
-          <p class="ww-status">
-            Discover topics from your Watch Later playlist.
-          </p>
-        </div>
+    const header = document.createElement("header");
+    header.className = "ww-heading";
 
-        <div class="ww-controls">
-          <button class="ww-scan" type="button">
-            Scan playlist
-          </button>
+    const info = document.createElement("div");
 
-          <div class="ww-view-toggle">
-            <button class="ww-view-btn ww-selected"
-              data-view="grid" type="button">Grid</button>
-            <button class="ww-view-btn"
-              data-view="list" type="button">List</button>
-          </div>
-        </div>
-      </div>
+    const eyebrow = document.createElement("div");
+    eyebrow.className = "ww-eyebrow";
+    eyebrow.textContent = "YOUR PERSONAL VIDEO ORGANIZER";
 
-      <div class="ww-filters"></div>
-      <div class="ww-grid"></div>
-    `;
+    const title = document.createElement("h2");
+    title.textContent = "WatchWise";
 
-    playlistContents = getContents();
+    const status = document.createElement("p");
+    status.className = "ww-status";
+    status.textContent = "Connecting to Watch Later...";
 
-    if (playlistContents?.parentElement) {
-      playlistContents.parentElement.insertBefore(
-        root,
-        playlistContents
-      );
-    } else {
-      return null;
-    }
+    info.append(eyebrow, title, status);
 
-    root.querySelector(".ww-scan").addEventListener(
-      "click",
-      scanPlaylist
-    );
+    const controls = document.createElement("div");
+    controls.className = "ww-controls";
 
-    root.querySelectorAll(".ww-view-btn").forEach(button => {
+    const toggle = document.createElement("div");
+    toggle.className = "ww-view-toggle";
+
+    ["grid", "list"].forEach(view => {
+      const button = document.createElement("button");
+      button.className = "ww-view-btn";
+      button.dataset.view = view;
+      button.textContent = view === "grid" ? "Grid" : "List";
+
+      if (view === "grid") button.classList.add("ww-selected");
+
       button.addEventListener("click", () => {
-        viewMode = button.dataset.view;
-        root.dataset.view = viewMode;
+        root.dataset.view = view;
 
-        root.querySelectorAll(".ww-view-btn").forEach(btn => {
-          btn.classList.toggle(
-            "ww-selected",
-            btn === button
-          );
+        toggle.querySelectorAll(".ww-view-btn").forEach(item => {
+          item.classList.toggle("ww-selected", item === button);
         });
       });
+
+      toggle.appendChild(button);
     });
+
+    const rescan = document.createElement("button");
+    rescan.className = "ww-view-btn";
+    rescan.textContent = "Rescan playlist";
+
+    rescan.addEventListener("click", () => {
+      if (loading) return;
+      reset();
+      initialize();
+    });
+
+    controls.append(rescan, toggle);
+    header.append(info, controls);
+
+    const progress = document.createElement("div");
+    progress.className = "ww-progress";
+
+    const progressBar = document.createElement("div");
+    progressBar.className = "ww-progress-bar";
+    progress.appendChild(progressBar);
+
+    const filters = document.createElement("div");
+    filters.className = "ww-filters";
+
+    const grid = document.createElement("div");
+    grid.className = "ww-grid";
+
+    root.append(header, progress, filters, grid);
+
+    native.parentElement.insertBefore(root, native);
+    native.classList.add("ww-native-hidden");
 
     return root;
   }
 
-  function makeChip(label, category) {
+  function setStatus(message, percentage = null) {
+    const root = document.getElementById("watchwise-root");
+    if (!root) return;
+
+    const status = root.querySelector(".ww-status");
+    if (status) status.textContent = message;
+
+    const progress = root.querySelector(".ww-progress");
+    const bar = root.querySelector(".ww-progress-bar");
+
+    if (percentage === null) {
+      progress.style.display = "none";
+    } else {
+      progress.style.display = "block";
+      bar.style.width = `${Math.min(100, percentage)}%`;
+    }
+  }
+
+  // --------------------------------
+  // VIDEO RENDERING
+  // --------------------------------
+
+  function makeChip(label) {
     const button = document.createElement("button");
 
-    button.type = "button";
     button.className = "ww-chip";
+    button.type = "button";
     button.textContent = label;
 
-    if (activeCategory === category) {
+    if (selectedCategory === label) {
       button.classList.add("ww-active");
     }
 
-    button.setAttribute(
-      "aria-pressed",
-      String(activeCategory === category)
-    );
-
     button.addEventListener("click", () => {
-      activeCategory = category;
-      renderResults();
+      selectedCategory = label;
+      render();
     });
 
     return button;
   }
 
-  function renderResults() {
-    const root = document.getElementById(ROOT_ID);
+  function render() {
+    const root = document.getElementById("watchwise-root");
     if (!root) return;
 
     const filters = root.querySelector(".ww-filters");
@@ -568,52 +1022,39 @@
     filters.replaceChildren();
     grid.replaceChildren();
 
-    filters.appendChild(
-      makeChip(`All (${videos.size})`, "all")
-    );
+    filters.appendChild(makeChip("All"));
 
     categories.forEach(category => {
-      filters.appendChild(
-        makeChip(
-          `${category.name} (${category.videos.length})`,
-          category.name
-        )
-      );
+      filters.appendChild(makeChip(category.name));
     });
 
-    const selectedVideos = activeCategory === "all"
-      ? [...videos.values()]
-      : categories.find(
-          category => category.name === activeCategory
-        )?.videos || [];
+    filters.appendChild(makeChip("Other"));
+
+    const selected = [...videos.values()].filter(video =>
+      selectedCategory === "All" ||
+      video.category === selectedCategory
+    );
 
     const fragment = document.createDocumentFragment();
 
-    selectedVideos.forEach(video => {
+    selected.forEach(video => {
       const card = document.createElement("a");
 
       card.className = "ww-card";
       card.href = video.url;
       card.target = "_blank";
       card.rel = "noopener noreferrer";
-      card.title = video.title;
 
       const image = document.createElement("img");
-
       image.className = "ww-thumbnail";
-      image.alt = "";
       image.loading = "lazy";
+      image.alt = video.title;
       image.src = video.thumbnail;
 
       image.addEventListener("error", () => {
-        if (!image.dataset.fallback) {
-          image.dataset.fallback = "true";
-          image.src =
-            `https://i.ytimg.com/vi/${video.id}/mqdefault.jpg`;
-        } else {
-          image.style.visibility = "hidden";
-        }
-      });
+        image.src =
+          `https://i.ytimg.com/vi/${video.id}/mqdefault.jpg`;
+      }, { once: true });
 
       const details = document.createElement("div");
       details.className = "ww-card-details";
@@ -623,244 +1064,221 @@
 
       const meta = document.createElement("p");
       meta.className = "ww-card-meta";
-      meta.textContent = [
-        video.duration,
-        video.category
-      ].filter(Boolean).join(" · ");
+      meta.textContent = [video.duration, video.category]
+        .filter(Boolean)
+        .join(" · ");
 
       details.append(title, meta);
       card.append(image, details);
-
       fragment.appendChild(card);
     });
 
     grid.appendChild(fragment);
 
-    root.querySelector(".ww-status").textContent =
-      `${selectedVideos.length} videos shown · ` +
-      `${categories.length} discovered topics · ` +
-      `${videos.size} collected`;
+    let message = `${selected.length} videos shown · ${videos.size} collected`;
+
+    if (loading) {
+      message += " · Indexing the rest in the background";
+    } else if (fullLoaded) {
+      message += " · Playlist fully indexed";
+    } else if (loadError) {
+      message += ` · ${loadError}`;
+    }
+
+    setStatus(message);
   }
 
-  // -------------------------------
-  // PLAYLIST SCANNER
-  // -------------------------------
+  // --------------------------------
+  // FULL PLAYLIST INDEXING
+  // --------------------------------
 
-  function getScrollElement() {
-    return document.scrollingElement || document.documentElement;
-  }
+  async function loadEntirePlaylist() {
+    if (loading || fullLoaded) return;
 
-  async function scanPlaylist() {
-    if (scanning) return;
+    if (!continuation) {
+      fullLoaded = true;
+      render();
+      return;
+    }
 
-    const root = document.getElementById(ROOT_ID);
-    playlistContents = getContents();
-
-    if (!root || !playlistContents) return;
-
-    scanning = true;
-
-    const button = root.querySelector(".ww-scan");
-    const status = root.querySelector(".ww-status");
-
-    button.disabled = true;
-    button.textContent = "Scanning...";
-
-    // Allow a fresh scan after revealing the native playlist.
-    playlistContents.classList.remove("ww-native-hidden");
-
-    videos.clear();
-    categories = [];
-    activeCategory = "all";
-
-    const scrollElement = getScrollElement();
-    const originalScroll = window.scrollY;
-
-    let unchangedRounds = 0;
-    let rounds = 0;
-    let lastHeight = 0;
+    loading = true;
+    let pages = 0;
 
     try {
-      while (rounds < MAX_ROUNDS) {
-        const added = collectVisibleVideos();
+      while (continuation && pages < MAX_PAGES && !stopped) {
+        const previousCount = videos.size;
 
-        if (added > 0) {
-          unchangedRounds = 0;
-        } else {
-          unchangedRounds++;
-        }
+        await fetchNextPage();
 
-        const currentHeight = scrollElement.scrollHeight;
-
-        status.textContent =
-          `Collecting playlist... ${videos.size} videos found`;
-
-        const atBottom =
-          window.innerHeight + window.scrollY >=
-          currentHeight - 180;
-
-        if (atBottom) {
-          // Give YouTube time to load the next batch.
-          await wait(1000);
-
-          const newlyAdded = collectVisibleVideos();
-
-          if (newlyAdded > 0) {
-            unchangedRounds = 0;
-          } else {
-            unchangedRounds++;
-          }
-
-          const newHeight = scrollElement.scrollHeight;
-
-          if (
-            unchangedRounds >= 12 &&
-            newHeight <= currentHeight
-          ) {
-            break;
-          }
-        } else {
-          window.scrollBy({
-            top: Math.max(500, window.innerHeight * 0.8),
-            behavior: "instant"
-          });
-
-          await wait(650);
-        }
-
-        if (currentHeight !== lastHeight) {
-          lastHeight = currentHeight;
-        }
-
-        rounds++;
-      }
-
-      collectVisibleVideos();
-
-      const allVideos = [...videos.values()];
-
-      if (allVideos.length < 15) {
-        status.textContent =
-          `Only ${allVideos.length} videos found. ` +
-          `Please check that Watch Later is fully loaded.`;
-        return;
-      }
-
-      status.textContent =
-        `Discovering topics from ${Math.min(
-          SAMPLE_SIZE,
-          allVideos.length
-        )} sample videos...`;
-
-      // Use a deterministic sample spread across the collection.
-      const sample = allVideos.length <= SAMPLE_SIZE
-        ? allVideos
-        : Array.from(
-            { length: SAMPLE_SIZE },
-            (_, index) => {
-              const position = Math.floor(
-                index * (allVideos.length - 1) /
-                (SAMPLE_SIZE - 1)
-              );
-
-              return allVideos[position];
-            }
+        if (videos.size <= previousCount) {
+          throw new Error(
+            "The next playlist page did not add any new videos."
           );
+        }
 
-      const discovery = discoverTopics(sample, allVideos);
+        pages++;
 
-      if (!discovery.groups.length) {
-        status.textContent =
-          "Not enough repeated title keywords to discover topics.";
-        return;
+        classifyVideos();
+
+        if (pages % RENDER_EVERY === 0) {
+          render();
+
+          setStatus(
+            `Indexing playlist · ${videos.size} videos collected`,
+            Math.min(95, pages / MAX_PAGES * 100)
+          );
+        }
+
+        await sleep(PAGE_DELAY);
       }
 
-      status.textContent =
-        "Classifying all collected videos...";
+      if (continuation && !stopped) {
+        throw new Error(
+          "Stopped at the safety limit. The playlist may be larger than expected."
+        );
+      }
 
-      categories = classifyAllVideos(
-        allVideos,
-        discovery
-      );
+      if (!stopped) {
+        fullLoaded = true;
+        classifyVideos();
+        loadError = null;
 
-      activeCategory = "all";
+        console.log(
+          "WatchWise: Full playlist indexed:",
+          videos.size
+        );
+      }
 
-      // Hide YouTube's original list only after collection.
-      playlistContents.classList.add("ww-native-hidden");
-
-      renderResults();
-
-      button.textContent = "Rescan playlist";
     } catch (error) {
-      console.error("WatchWise V3 error:", error);
-
-      status.textContent =
-        "Something went wrong. Check the browser console.";
-
-      playlistContents?.classList.remove("ww-native-hidden");
+      console.error("WatchWise indexing error:", error);
+      loadError = error.message;
     } finally {
-      window.scrollTo({
-        top: originalScroll,
-        behavior: "instant"
-      });
-
-      scanning = false;
-      button.disabled = false;
-
-      if (button.textContent === "Scanning...") {
-        button.textContent = "Try again";
-      }
+      loading = false;
+      render();
     }
   }
 
-  // -------------------------------
-  // INITIALIZATION / NAVIGATION
-  // -------------------------------
+  // --------------------------------
+  // INITIALIZATION
+  // --------------------------------
 
-  function reset() {
-    playlistContents?.classList.remove("ww-native-hidden");
-
-    document.getElementById(ROOT_ID)?.remove();
-
-    videos.clear();
-    categories = [];
-    activeCategory = "all";
-    scanning = false;
-    playlistContents = null;
-  }
-
-  function initialize() {
+  async function initialize() {
     if (!isWatchLater()) return;
 
-    if (document.getElementById(ROOT_ID)) return;
+    const root = createInterface();
+    if (!root) return;
 
-    const contents = getContents();
+    try {
+      let data = window.ytInitialData;
 
-    if (!contents) return;
+      for (let i = 0; !data && i < 20; i++) {
+        await sleep(300);
+        data = window.ytInitialData;
+      }
 
-    createInterface();
+      if (!data) {
+        throw new Error("YouTube page data was unavailable.");
+      }
+
+      if (!readInitialPlaylist(data)) {
+        throw new Error(
+          "No Watch Later videos were found in YouTube's page data."
+        );
+      }
+
+      // Discover categories using only the newest sample.
+      let pages = 0;
+
+      while (
+        videos.size < SAMPLE_SIZE &&
+        continuation &&
+        pages < 20
+      ) {
+        await fetchNextPage();
+        pages++;
+      }
+
+      const sample = [...videos.values()].slice(0, SAMPLE_SIZE);
+
+      if (sample.length < 15) {
+        throw new Error(
+          `Only ${sample.length} videos were retrieved. Not enough to discover topics.`
+        );
+      }
+
+      setStatus(
+        `Discovering topics from ${sample.length} recent videos...`
+      );
+
+      discoverTopics(sample);
+      classifyVideos();
+
+      selectedCategory = "All";
+      render();
+
+      // Continue indexing in the background.
+      if (continuation) {
+        loadEntirePlaylist();
+      } else {
+        fullLoaded = true;
+        render();
+      }
+
+    } catch (error) {
+      console.error("WatchWise initialization:", error);
+      loadError = error.message;
+      setStatus(`Unable to initialize: ${error.message}`);
+    }
   }
 
-  function handleNavigation() {
+  // --------------------------------
+  // RESET AND YOUTUBE NAVIGATION
+  // --------------------------------
+
+  function reset() {
+    stopped = true;
+
+    nativePlaylist?.classList.remove("ww-native-hidden");
+
+    document.getElementById("watchwise-root")?.remove();
+
+    videos.clear();
+    videos = new Map();
+
+    categories = [];
+    vocabulary = new Map();
+
+    continuation = null;
+    clickTrackingParams = null;
+
+    fullLoaded = false;
+    loading = false;
+    loadError = null;
+    stopped = false;
+
+    selectedCategory = "All";
+    nativePlaylist = null;
+  }
+
+  let navigationTimer = null;
+
+  function navigate() {
+    clearTimeout(navigationTimer);
+
     reset();
 
     if (isWatchLater()) {
-      setTimeout(initialize, 700);
-      setTimeout(initialize, 1800);
+      navigationTimer = setTimeout(initialize, 1200);
     }
   }
 
-  // Initial page.
-  setTimeout(initialize, 700);
+  setTimeout(initialize, 1200);
 
-  // YouTube single-page navigation.
   document.addEventListener(
     "yt-navigate-finish",
-    handleNavigation
+    navigate
   );
 
-  window.addEventListener(
-    "popstate",
-    handleNavigation
-  );
+  window.addEventListener("popstate", navigate);
+
 })();
