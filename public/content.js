@@ -2,8 +2,8 @@
 (() => {
   "use strict";
 
-  if (window.__WATCHWISE_V7__) return;
-  window.__WATCHWISE_V7__ = true;
+  if (window.__WATCHWISE_V9__) return;
+  window.__WATCHWISE_V9__ = true;
 
   // SETTINGS
   const SAMPLE_SIZE = 200;
@@ -67,20 +67,11 @@
     return output;
   }
 
-  function findFirst(object, key) {
-    return findAll(object, key)[0] || null;
-  }
-
   function getText(value) {
     if (!value) return "";
-
     if (typeof value === "string") return value;
-
     if (value.simpleText) return value.simpleText;
-
-    if (typeof value.content === "string") {
-      return value.content;
-    }
+    if (typeof value.content === "string") return value.content;
 
     if (value.runs) {
       return value.runs.map(x => x.text || "").join("");
@@ -91,9 +82,6 @@
 
   // --------------------------------
   // VIDEO EXTRACTION
-  // Supports:
-  // - playlistVideoRenderer (older YouTube)
-  // - lockupViewModel (newer YouTube)
   // --------------------------------
 
   function addVideoData(id, title, thumbnail, duration) {
@@ -102,8 +90,7 @@
     videos.set(id, {
       id,
       title,
-      thumbnail:
-        thumbnail ||
+      thumbnail: thumbnail ||
         `https://i.ytimg.com/vi/${id}/mqdefault.jpg`,
       duration: duration || "",
       url: `https://www.youtube.com/watch?v=${id}`,
@@ -153,7 +140,6 @@
 
     if (!id || !title) return;
 
-    // New YouTube thumbnail format.
     const thumbnailSources = findAll(
       lockup.contentImage || {},
       "url"
@@ -167,7 +153,6 @@
         )
         .at(-1) || "";
 
-    // New YouTube duration badge format.
     const badges = findAll(
       lockup.contentImage || {},
       "thumbnailBadgeViewModel"
@@ -184,7 +169,6 @@
       }
     }
 
-    // Older overlay fallback.
     if (!duration) {
       const overlays = findAll(
         lockup,
@@ -193,7 +177,6 @@
 
       for (const overlay of overlays) {
         const text = getText(overlay?.text);
-
         if (text) {
           duration = text;
           break;
@@ -215,7 +198,6 @@
       addLockupVideo(item.lockupViewModel);
     }
 
-    // Some YouTube layouts wrap their items.
     if (item.richItemRenderer?.content) {
       extractVideoFromItem(item.richItemRenderer.content);
     }
@@ -238,44 +220,68 @@
   }
 
   // --------------------------------
-  // CONTINUATION EXTRACTION
-  //
-  // IMPORTANT:
-  // Only inspect the continuation item belonging
-  // to the actual playlist video list.
-  //
-  // Do not use unrelated section-level tokens.
+  // CONTINUATION TOKEN EXTRACTION
   // --------------------------------
 
   function tokenFromContinuationItem(item) {
-    if (!item || typeof item !== "object") {
-      return null;
+    if (!item || typeof item !== "object") return null;
+
+    // Older YouTube continuation renderer.
+    const oldRenderer = item.continuationItemRenderer;
+
+    if (oldRenderer) {
+      const endpoint = oldRenderer.continuationEndpoint;
+
+      // Actual format found in your console:
+      // endpoint.commandExecutorCommand.commands[].continuationCommand.token
+
+      const commands =
+        endpoint?.commandExecutorCommand?.commands || [];
+
+      for (const commandItem of commands) {
+        const command = commandItem?.continuationCommand;
+
+        if (command?.token) {
+          return {
+            token: command.token,
+            clickTrackingParams:
+              endpoint?.clickTrackingParams || null
+          };
+        }
+      }
+
+      // Other older formats.
+      const directToken =
+        endpoint?.continuationCommand?.token ||
+        endpoint?.command?.continuationCommand?.token;
+
+      if (directToken) {
+        return {
+          token: directToken,
+          clickTrackingParams:
+            endpoint?.clickTrackingParams || null
+        };
+      }
+
+      if (endpoint) {
+        const nestedCommands = findAll(
+          endpoint,
+          "continuationCommand"
+        );
+
+        for (const command of nestedCommands) {
+          if (command?.token) {
+            return {
+              token: command.token,
+              clickTrackingParams:
+                endpoint.clickTrackingParams || null
+            };
+          }
+        }
+      }
     }
 
-    // Older format.
-    const oldCommand =
-      item.continuationItemRenderer
-        ?.continuationEndpoint
-        ?.continuationCommand;
-
-    if (oldCommand?.token) {
-      return {
-        token: oldCommand.token,
-        clickTrackingParams:
-          item.continuationItemRenderer
-            ?.continuationEndpoint
-            ?.clickTrackingParams ||
-          null
-      };
-    }
-
-    // Newer format:
-    // continuationItemViewModel
-    //   .continuationCommand
-    //   .innertubeCommand
-    //   .continuationCommand
-    //   .token
-
+    // Newer continuationItemViewModel format.
     const model = item.continuationItemViewModel;
 
     if (model) {
@@ -303,7 +309,6 @@
         };
       }
 
-      // Fallback for experiments that move the nested command.
       const nestedCommands = findAll(
         model,
         "continuationCommand"
@@ -326,11 +331,8 @@
   function continuationFromItems(items) {
     if (!Array.isArray(items)) return null;
 
-    // The playlist continuation is normally the last item.
-    // Search backwards, but only within this playlist's items.
     for (let i = items.length - 1; i >= 0; i--) {
       const result = tokenFromContinuationItem(items[i]);
-
       if (result) return result;
     }
 
@@ -347,8 +349,7 @@
       extractVideosFromItems(playlist.contents);
 
       if (videos.size > before || playlist.contents.length) {
-        const next =
-          continuationFromItems(playlist.contents);
+        const next = continuationFromItems(playlist.contents);
 
         if (next) return next;
 
@@ -392,12 +393,8 @@
 
         extractVideosFromItems(items);
 
-        // Only accept a section containing actual playlist videos.
         if (videos.size === before) continue;
 
-        // This is the important part:
-        // use the token INSIDE itemSectionRenderer.contents.
-        // Do not use a sibling token in sectionListRenderer.contents.
         return continuationFromItems(items);
       }
     }
@@ -406,7 +403,6 @@
   }
 
   function readInitialPlaylist(data) {
-    // Prefer the old, explicit playlist renderer when available.
     let next = extractOldPlaylist(data);
 
     if (!next) {
@@ -428,11 +424,82 @@
   }
 
   // --------------------------------
+  // AUTHENTICATION
+  // --------------------------------
+
+  function getCookie(name) {
+    const prefix = `${name}=`;
+    const entry = document.cookie
+      .split(";")
+      .map(part => part.trim())
+      .find(part => part.startsWith(prefix));
+
+    if (!entry) return null;
+
+    return decodeURIComponent(entry.slice(prefix.length));
+  }
+
+  async function sha1Hex(value) {
+    const data = new TextEncoder().encode(value);
+    const digest = await crypto.subtle.digest("SHA-1", data);
+
+    return [...new Uint8Array(digest)]
+      .map(byte => byte.toString(16).padStart(2, "0"))
+      .join("");
+  }
+
+  async function getYouTubeAuthHeaders(config) {
+    const origin = location.origin;
+    const timestamp = Math.floor(Date.now() / 1000);
+
+    const cookieTypes = [
+      ["SAPISID", "SAPISIDHASH"],
+      ["__Secure-1PAPISID", "SAPISID1PHASH"],
+      ["__Secure-3PAPISID", "SAPISID3PHASH"]
+    ];
+
+    const authorizationParts = [];
+
+    for (const [cookieName, scheme] of cookieTypes) {
+      const cookieValue = getCookie(cookieName);
+
+      if (!cookieValue) continue;
+
+      const hash = await sha1Hex(
+        `${timestamp} ${cookieValue} ${origin}`
+      );
+
+      authorizationParts.push(
+        `${scheme} ${timestamp}_${hash}`
+      );
+    }
+
+    if (!authorizationParts.length) {
+      throw new Error(
+        "YouTube authentication cookie was not accessible. " +
+        "Refresh YouTube and check that you are signed in."
+      );
+    }
+
+    const headers = {
+      "Authorization": authorizationParts.join(" "),
+      "X-Goog-AuthUser": String(config.sessionIndex ?? 0),
+      "X-Origin": origin,
+      "X-Youtube-Bootstrap-Logged-In": "true"
+    };
+
+    if (config.delegatedSessionId) {
+      headers["X-Goog-PageId"] = config.delegatedSessionId;
+    }
+
+    return headers;
+  }
+
+  // --------------------------------
   // CONTINUATION RESPONSE EXTRACTION
   // --------------------------------
 
   function getContinuationItems(data) {
-    // Standard modern and older append response.
     const appendActions = findAll(
       data,
       "appendContinuationItemsAction"
@@ -440,11 +507,9 @@
 
     for (let i = appendActions.length - 1; i >= 0; i--) {
       const items = appendActions[i]?.continuationItems;
-
       if (Array.isArray(items)) return items;
     }
 
-    // Alternate response command.
     const reloadCommands = findAll(
       data,
       "reloadContinuationItemsCommand"
@@ -452,11 +517,9 @@
 
     for (let i = reloadCommands.length - 1; i >= 0; i--) {
       const items = reloadCommands[i]?.continuationItems;
-
       if (Array.isArray(items)) return items;
     }
 
-    // Older continuationContents response.
     const oldLists = findAll(
       data,
       "playlistVideoListContinuation"
@@ -468,7 +531,6 @@
       }
     }
 
-    // Some responses expose itemSectionContinuation.
     const sectionContinuations = findAll(
       data,
       "itemSectionContinuation"
@@ -483,8 +545,19 @@
     return null;
   }
 
+  function getYouTubeError(data) {
+    const alerts = findAll(data, "alertRenderer");
+
+    for (const alert of alerts) {
+      const message = getText(alert?.text);
+      if (message) return message;
+    }
+
+    return null;
+  }
+
   // --------------------------------
-  // YOUTUBE BACKGROUND API
+  // YOUTUBE CONFIGURATION
   // --------------------------------
 
   function getYouTubeConfig() {
@@ -506,14 +579,21 @@
       context,
       clientName: config.get("INNERTUBE_CLIENT_NAME") || 1,
       clientVersion: config.get("INNERTUBE_CLIENT_VERSION") || "",
-      visitorData: config.get("VISITOR_DATA")
+      visitorData: config.get("VISITOR_DATA"),
+      sessionIndex: config.get("SESSION_INDEX"),
+      delegatedSessionId: config.get("DELEGATED_SESSION_ID")
     };
   }
+
+  // --------------------------------
+  // BACKGROUND PAGE REQUEST
+  // --------------------------------
 
   async function fetchNextPage() {
     if (!continuation) return false;
 
     const config = getYouTubeConfig();
+    const authHeaders = await getYouTubeAuthHeaders(config);
 
     const oldToken = continuation;
     const oldCount = videos.size;
@@ -525,7 +605,7 @@
       "Content-Type": "application/json",
       "X-YouTube-Client-Name": String(config.clientName),
       "X-YouTube-Client-Version": config.clientVersion,
-      "X-Origin": location.origin
+      ...authHeaders
     };
 
     if (config.visitorData) {
@@ -546,20 +626,34 @@
     const response = await fetch(endpoint, {
       method: "POST",
       credentials: "include",
+      cache: "no-store",
       headers,
       body: JSON.stringify(body),
       referrer: location.href
     });
 
     if (!response.ok) {
+      const responseText = await response.text().catch(() => "");
+
       throw new Error(
-        `YouTube API returned HTTP ${response.status}.`
+        `YouTube API returned HTTP ${response.status}: ` +
+        responseText.slice(0, 250)
       );
     }
 
     const data = await response.json();
 
-    // Extract only the actual continuation page items.
+    // Surface YouTube's own error message instead of a generic parser error.
+    const youtubeError = getYouTubeError(data);
+
+    if (youtubeError) {
+      console.error("WatchWise YouTube API error:", youtubeError, data);
+
+      throw new Error(
+        `YouTube rejected the continuation request: ${youtubeError}`
+      );
+    }
+
     const items = getContinuationItems(data);
 
     if (!items) {
@@ -569,7 +663,8 @@
       );
 
       throw new Error(
-        "YouTube returned an unfamiliar continuation response. Open the console for details."
+        "YouTube returned an unfamiliar continuation response. " +
+        "Open the console for details."
       );
     }
 
@@ -583,7 +678,7 @@
       );
 
       throw new Error(
-        "YouTube returned a page without recognizable playlist videos. Check the console."
+        "YouTube returned a page without recognizable playlist videos."
       );
     }
 
@@ -882,7 +977,6 @@
 
   function createInterface() {
     const native = findNativePlaylist();
-
     if (!native) return null;
 
     const existing = document.getElementById("watchwise-root");
@@ -924,7 +1018,9 @@
       button.dataset.view = view;
       button.textContent = view === "grid" ? "Grid" : "List";
 
-      if (view === "grid") button.classList.add("ww-selected");
+      if (view === "grid") {
+        button.classList.add("ww-selected");
+      }
 
       button.addEventListener("click", () => {
         root.dataset.view = view;
@@ -1075,7 +1171,8 @@
 
     grid.appendChild(fragment);
 
-    let message = `${selected.length} videos shown · ${videos.size} collected`;
+    let message =
+      `${selected.length} videos shown · ${videos.size} collected`;
 
     if (loading) {
       message += " · Indexing the rest in the background";
@@ -1117,7 +1214,6 @@
         }
 
         pages++;
-
         classifyVideos();
 
         if (pages % RENDER_EVERY === 0) {
@@ -1186,7 +1282,7 @@
         );
       }
 
-      // Discover categories using only the newest sample.
+      // Discover categories using the newest sample.
       let pages = 0;
 
       while (
@@ -1202,7 +1298,8 @@
 
       if (sample.length < 15) {
         throw new Error(
-          `Only ${sample.length} videos were retrieved. Not enough to discover topics.`
+          `Only ${sample.length} videos were retrieved. ` +
+          "Not enough to discover topics."
         );
       }
 
@@ -1216,7 +1313,7 @@
       selectedCategory = "All";
       render();
 
-      // Continue indexing in the background.
+      // Continue indexing the rest in the background.
       if (continuation) {
         loadEntirePlaylist();
       } else {
@@ -1264,7 +1361,6 @@
 
   function navigate() {
     clearTimeout(navigationTimer);
-
     reset();
 
     if (isWatchLater()) {
